@@ -32,7 +32,8 @@ export function ConsultationModal({ isOpen, onClose }: ConsultationModalProps) {
 
     try {
       window.location.href = `https://timerex.net/s/sales_5e77_b801/482a66cf?apiKey=1ufKAEnDi4T0pk5lftqMqjiNmF5SQh8x3Va4pLe5oitNLtgKCuI7BKH5sI0SGLeI&name=${encodeURIComponent(fullName)}&email=${encodeURIComponent(email)}`;
-    } catch (err) {
+    } catch (e) {
+      console.error(e);
       setError('Something went wrong. Please try again.');
       setSubmitting(false);
     }

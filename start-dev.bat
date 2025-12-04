@@ -1,0 +1,3 @@
+@echo off
+echo Starting Robolab Web Scanner...
+npm run dev

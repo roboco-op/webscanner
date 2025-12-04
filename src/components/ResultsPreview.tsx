@@ -2,18 +2,183 @@ import { useState } from 'react';
 import { Shield, Zap, Eye, AlertTriangle, Mail, Loader2, CheckCircle, Search, Lock, BarChart3, Calendar } from 'lucide-react';
 import type { ScanResult } from '../types/scan';
 
+// AI Summary card component (standalone, not nested inside helpers)
+function AISummaryCard({
+  summary,
+  recommendations,
+  scanId,
+  onUpdate,
+}: {
+  summary: string | null;
+  recommendations: string[];
+  scanId: string;
+  onUpdate: (s: string | null, r: string[]) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [aiDisabled, setAiDisabled] = useState(false);
+
+  const regenerate = async () => {
+    if (aiDisabled) return;
+    setError(null);
+    setLoading(true);
+    try {
+      const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/regenerate-ai`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+        },
+        body: JSON.stringify({ scanId }),
+      });
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        // Detect missing Gemini key scenario
+        if (txt.includes('GEMINI_API_KEY') || res.status === 500) {
+          setAiDisabled(true);
+          throw new Error('AI feature is not enabled');
+        }
+        throw new Error(`Regenerate failed: ${res.status} ${txt}`);
+      }
+
+      const data = await res.json();
+      onUpdate(data.ai_summary ?? null, data.ai_recommendations ?? []);
+      setExpanded(true);
+    } catch (err: unknown) {
+      console.error('Regenerate error', err);
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const copy = async () => {
+    if (!summary) return;
+    try {
+      await navigator.clipboard.writeText(summary);
+    } catch (e) {
+      console.warn('copy failed', e);
+    }
+  };
+
+  return (
+    <div className="bg-white/10 backdrop-blur-sm rounded-lg p-6 mb-8 border border-white/20">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex-1">
+          <div className="flex items-center gap-2 mb-3">
+            <h3 className="text-lg font-bold text-white">AI Analysis Summary</h3>
+            <span className="text-xs font-medium px-2 py-1 bg-blue-500 text-white rounded-full">Powered by AI</span>
+            {aiDisabled && (
+              <span className="text-xs px-2 py-1 rounded bg-white/20 text-white">Disabled</span>
+            )}
+          </div>
+          {loading ? (
+            <div className="animate-pulse space-y-3">
+              <div className="h-4 bg-white/20 rounded w-3/4" />
+              <div className="h-4 bg-white/10 rounded w-5/6" />
+              <div className="h-4 bg-white/10 rounded w-2/3" />
+            </div>
+          ) : summary ? (
+            <p className="text-blue-100 leading-relaxed text-base">{expanded ? summary : summary.slice(0, 300) + (summary.length > 300 ? '…' : '')}</p>
+          ) : (
+            <p className="text-blue-200 italic text-sm">No AI analysis available for this scan.</p>
+          )}
+          {!loading && recommendations && recommendations.length > 0 && (
+            <ul className="mt-3 text-sm text-blue-100 list-disc list-inside">
+              {recommendations.slice(0, 5).map((r, i) => (
+                <li key={i}>{r}</li>
+              ))}
+            </ul>
+          )}
+          {error && <p className="text-red-400 text-sm mt-2">{error}</p>}
+          {aiDisabled && !error && (
+            <p className="text-xs text-blue-200 mt-2 italic">AI analysis is currently unavailable.</p>
+          )}
+        </div>
+
+        <div className="flex flex-col items-end gap-2">
+            <div className="flex gap-2">
+              <button
+                type="button"
+                className="px-3 py-1 bg-white/10 text-white rounded border border-white/20 text-sm hover:bg-white/20 disabled:opacity-40"
+                onClick={() => setExpanded((s) => !s)}
+                disabled={loading || !summary}
+              >
+                {expanded ? 'Show less' : 'Show more'}
+              </button>
+              {!aiDisabled && (
+                <button
+                  type="button"
+                  disabled={loading || !scanId}
+                  onClick={regenerate}
+                  className="px-3 py-1 bg-blue-600 text-white rounded text-sm disabled:opacity-50"
+                >
+                  {loading ? 'Regenerating…' : 'Regenerate'}
+                </button>
+              )}
+            </div>
+            {summary && !loading && (
+              <button
+                type="button"
+                onClick={copy}
+                className="text-xs text-blue-100 underline"
+              >
+                Copy summary
+              </button>
+            )}
+          </div>
+      </div>
+    </div>
+  );
+}
+
 interface ResultsPreviewProps {
   result: ScanResult;
   onEmailSubmit: (email: string, optIn: boolean) => Promise<void>;
   onScanAnother: () => void;
 }
 
-export function ResultsPreview({ result, onEmailSubmit, onScanAnother }: ResultsPreviewProps) {
+export default function ResultsPreview({ result, onEmailSubmit, onScanAnother }: ResultsPreviewProps) {
   const [email, setEmail] = useState('');
   const [optIn, setOptIn] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState('');
+  
+  // Parse AI summary if it's wrapped in markdown code blocks
+  const parseAISummary = (raw: string | null): { summary: string | null; recommendations: string[] } => {
+    if (!raw) return { summary: null, recommendations: [] };
+    
+    try {
+      // Remove markdown code blocks
+      let jsonStr = raw.trim();
+      if (jsonStr.startsWith('```json')) {
+        jsonStr = jsonStr.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+      } else if (jsonStr.startsWith('```')) {
+        jsonStr = jsonStr.replace(/^```\s*/, '').replace(/\s*```$/, '');
+      }
+      
+      const parsed = JSON.parse(jsonStr);
+      return {
+        summary: parsed.summary || null,
+        recommendations: parsed.recommendations || []
+      };
+    } catch {
+      // If parsing fails, return raw content as summary
+      return { summary: raw, recommendations: [] };
+    }
+  };
+  
+  const initialParsed = parseAISummary(result.ai_summary ?? null);
+  const [aiSummary, setAiSummary] = useState<string | null>(initialParsed.summary);
+  const [aiRecs, setAiRecs] = useState<string[]>(
+    Array.isArray(result.ai_recommendations) && result.ai_recommendations.length > 0
+      ? result.ai_recommendations
+      : initialParsed.recommendations
+  );
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -28,7 +193,8 @@ export function ResultsPreview({ result, onEmailSubmit, onScanAnother }: Results
     try {
       await onEmailSubmit(email, optIn);
       setSubmitted(true);
-    } catch (err) {
+    } catch (e) {
+      console.error(e);
       setError('Failed to send report. Please try again.');
     } finally {
       setSubmitting(false);
@@ -44,127 +210,37 @@ export function ResultsPreview({ result, onEmailSubmit, onScanAnother }: Results
   const getSeverityColor = (severity: string) => {
     switch (severity) {
       case 'critical':
-        return 'bg-red-100 text-red-800 border-red-200';
+        return 'border-red-600 bg-red-50';
       case 'high':
-        return 'bg-orange-100 text-orange-800 border-orange-200';
+        return 'border-orange-500 bg-orange-50';
       case 'medium':
-        return 'bg-yellow-100 text-yellow-800 border-yellow-200';
+        return 'border-yellow-400 bg-yellow-50';
       default:
-        return 'bg-blue-100 text-blue-800 border-blue-200';
+        return 'border-gray-300 bg-gray-50';
     }
   };
 
   const getCategoryIcon = (category: string) => {
-    switch (category.toLowerCase()) {
-      case 'security':
-        return <Shield className="w-4 h-4" />;
-      case 'performance':
-        return <Zap className="w-4 h-4" />;
-      case 'accessibility':
-        return <Eye className="w-4 h-4" />;
-      default:
-        return <AlertTriangle className="w-4 h-4" />;
-    }
+    const c = category.toLowerCase();
+    if (c.includes('security')) return <Shield className="w-5 h-5 text-red-600" />;
+    if (c.includes('performance')) return <Zap className="w-5 h-5 text-green-600" />;
+    if (c.includes('access')) return <Eye className="w-5 h-5 text-orange-600" />;
+    return <AlertTriangle className="w-5 h-5 text-gray-600" />;
   };
-
-  if (result.scan_status === 'failed') {
-    return (
-      <div className="w-full max-w-3xl bg-white rounded-lg shadow-lg p-8">
-        <div className="text-center">
-          <AlertTriangle className="w-16 h-16 text-red-500 mx-auto mb-4" />
-          <h2 className="text-2xl font-bold text-gray-900 mb-2">Scan Failed</h2>
-          <p className="text-gray-600 mb-6">
-            We couldn't complete the scan. Please check the URL and try again.
-          </p>
-          <button
-            onClick={onScanAnother}
-            className="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors font-medium"
-          >
-            Scan Another Website
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (result.scan_status !== 'completed') {
-    return (
-      <div className="w-full max-w-3xl bg-white rounded-lg shadow-lg p-8">
-        <div className="text-center">
-          <Loader2 className="w-16 h-16 text-blue-500 mx-auto mb-4 animate-spin" />
-          <h2 className="text-2xl font-bold text-gray-900 mb-2">Analyzing Your Website...</h2>
-          <p className="text-gray-600">This usually takes 30-60 seconds</p>
-        </div>
-      </div>
-    );
-  }
-
   return (
-    <div className="w-full max-w-5xl space-y-6">
-      <div className="bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 rounded-xl shadow-2xl p-8 border-2 border-blue-500">
-        <div className="mb-6">
-          <div className="flex items-center gap-3 mb-2">
-            <div className="flex-shrink-0 w-10 h-10 bg-gradient-to-br from-blue-400 to-blue-600 rounded-lg flex items-center justify-center shadow-lg">
-              <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-              </svg>
-            </div>
-            <h2 className="text-2xl font-bold text-white">Robo-Lab Analysis Console</h2>
-          </div>
-          <p className="text-blue-200 text-sm ml-13">
-            Run a deep technical scan of any site. Inspect TLS & security headers, performance metrics, accessibility issues, and API behavior with a single click.
-          </p>
-        </div>
-
-        {(result.ai_summary || (result.ai_recommendations && result.ai_recommendations.length > 0)) && (
-          <div>
-
-          {result.ai_summary && (
-            <div className="bg-white/10 backdrop-blur-sm rounded-lg p-6 mb-6 border border-white/20">
-              <div className="flex items-center gap-2 mb-3">
-                <h3 className="text-lg font-bold text-white">AI Analysis Summary</h3>
-                <span className="text-xs font-medium px-2 py-1 bg-blue-500 text-white rounded-full">Powered by GPT-4</span>
-              </div>
-              <p className="text-blue-100 leading-relaxed text-base">{result.ai_summary}</p>
-            </div>
-          )}
-
-          {result.ai_recommendations && result.ai_recommendations.length > 0 && (
-            <div className="bg-white/10 backdrop-blur-sm rounded-lg p-6 border border-white/20">
-              <h3 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
-                <svg className="w-5 h-5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-                AI-Powered Recommendations
-              </h3>
-              <div className="space-y-3">
-                {result.ai_recommendations.map((rec, idx) => (
-                  <div key={idx} className="flex items-start gap-3 p-4 bg-white/5 rounded-lg border border-white/10 hover:bg-white/10 transition-colors">
-                    <span className="flex-shrink-0 w-6 h-6 bg-gradient-to-br from-green-400 to-green-600 text-white rounded-full flex items-center justify-center text-sm font-bold shadow-lg">
-                      {idx + 1}
-                    </span>
-                    <p className="text-blue-100 leading-relaxed flex-1">{rec}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-          </div>
-        )}
-      </div>
-
-      <div className="bg-white rounded-xl shadow-lg border border-gray-200 p-8">
+    <>
+    <div className="bg-white rounded-xl shadow-lg border border-gray-200 p-8">
         <div className="mb-8">
           <h2 className="text-2xl font-bold text-gray-900 mb-2">Scan Results</h2>
           <p className="text-gray-600">Detailed technical analysis of your website</p>
         </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 mb-8">
         <div className="bg-gray-50 rounded-lg shadow p-6 border-l-4 border-green-500">
           <div className="flex items-center justify-between mb-2">
             <Zap className="w-8 h-8 text-green-600" />
             <span className="text-3xl font-bold text-gray-900">
-              {result.performance_score ?? (result.performance_results as any)?.score ?? 0}
+              {result.performance_score ?? result.performance_results?.score ?? 0}
             </span>
           </div>
           <p className="text-sm font-medium text-gray-600">Performance</p>
@@ -175,7 +251,7 @@ export function ResultsPreview({ result, onEmailSubmit, onScanAnother }: Results
           <div className="flex items-center justify-between mb-2">
             <Search className="w-8 h-8 text-blue-600" />
             <span className="text-3xl font-bold text-gray-900">
-              {result.seo_score ?? (result.performance_results as any)?.lighthouse_scores?.seo ?? 0}
+              {result.seo_score ?? result.performance_results?.lighthouse_scores?.seo ?? 0}
             </span>
           </div>
           <p className="text-sm font-medium text-gray-600">SEO</p>
@@ -186,7 +262,7 @@ export function ResultsPreview({ result, onEmailSubmit, onScanAnother }: Results
           <div className="flex items-center justify-between mb-2">
             <Eye className="w-8 h-8 text-orange-600" />
             <span className="text-3xl font-bold text-gray-900">
-              {result.accessibility_issue_count ?? (result.accessibility_results as any)?.total_issues ?? 0}
+              {result.accessibility_issue_count ?? result.accessibility_results?.total_issues ?? 0}
             </span>
           </div>
           <p className="text-sm font-medium text-gray-600">Accessibility</p>
@@ -197,15 +273,73 @@ export function ResultsPreview({ result, onEmailSubmit, onScanAnother }: Results
           <div className="flex items-center justify-between mb-2">
             <Shield className="w-8 h-8 text-red-600" />
             <span className="text-3xl font-bold text-gray-900">
-              {result.security_checks_passed ?? ((result.security_results as any)?.issues ? (7 - (result.security_results as any).issues.length) : 7)}/{result.security_checks_total || 7}
+              {result.security_checks_passed ?? (result.security_results?.issues ? (7 - result.security_results.issues.length) : 7)}/{result.security_checks_total || 7}
             </span>
           </div>
           <p className="text-sm font-medium text-gray-600">Security</p>
           <p className="text-xs text-gray-500 mt-1">Security checks passed</p>
         </div>
+
+        <div className="bg-gray-50 rounded-lg shadow p-6 border-l-4 border-purple-500">
+          <div className="flex items-center justify-between mb-2">
+            <svg className="w-8 h-8 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 15l-2 5L9 9l11-4-5 2m0 0l5 5m-5-5v5m0 0H4m0 0v4" />
+            </svg>
+            <span className="text-3xl font-bold text-gray-900">
+              {result.e2e_results ? ((result.e2e_results.buttons_found || 0) > 0 ? 80 : 50) : 0}
+            </span>
+          </div>
+          <p className="text-sm font-medium text-gray-600">E2E Testing</p>
+          <p className="text-xs text-gray-500 mt-1">Interactive elements</p>
+        </div>
       </div>
 
-      {(result.performance_results as any)?.core_web_vitals && (result.performance_results as any)?.source === 'google-pagespeed' && (
+      {result.e2e_results && (
+        <div className="bg-gradient-to-br from-purple-50 to-pink-50 rounded-lg p-6 mb-8 border border-purple-200">
+          <div className="flex items-center gap-2 mb-4">
+            <div className="flex-shrink-0 w-10 h-10 bg-gradient-to-br from-purple-500 to-pink-600 rounded-lg flex items-center justify-center shadow">
+              <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 15l-2 5L9 9l11-4-5 2m0 0l5 5m-5-5v5m0 0H4m0 0v4" />
+              </svg>
+            </div>
+            <div>
+              <h3 className="text-lg font-bold text-gray-900">End-to-End Testing Analysis</h3>
+              <p className="text-xs text-gray-600">Interactive elements detected on the page</p>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+            <div className="bg-white rounded-lg p-4 border border-purple-200 shadow-sm">
+              <div className="text-2xl font-bold text-gray-900">{result.e2e_results.buttons_found ?? 0}</div>
+              <div className="text-xs font-medium text-gray-600 mt-1">Buttons</div>
+              <div className="text-xs text-gray-500 mt-1">Interactive elements</div>
+            </div>
+            <div className="bg-white rounded-lg p-4 border border-purple-200 shadow-sm">
+              <div className="text-2xl font-bold text-gray-900">{result.e2e_results.links_found ?? 0}</div>
+              <div className="text-xs font-medium text-gray-600 mt-1">Links</div>
+              <div className="text-xs text-gray-500 mt-1">Navigational elements</div>
+            </div>
+            <div className="bg-white rounded-lg p-4 border border-purple-200 shadow-sm">
+              <div className="text-2xl font-bold text-gray-900">{result.e2e_results.forms_found ?? 0}</div>
+              <div className="text-xs font-medium text-gray-600 mt-1">Forms</div>
+              <div className="text-xs text-gray-500 mt-1">User input elements</div>
+            </div>
+          </div>
+          {result.e2e_results.primary_actions && result.e2e_results.primary_actions.length > 0 && (
+            <div className="mt-4 pt-4 border-t border-purple-200">
+              <p className="text-xs font-medium text-gray-600 mb-2">Primary Actions Detected:</p>
+              <div className="flex flex-wrap gap-2">
+                {result.e2e_results.primary_actions.slice(0, 5).map((action, idx) => (
+                  <span key={idx} className="px-3 py-1 bg-purple-100 text-purple-800 rounded-full text-xs font-medium border border-purple-300">
+                    {action}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {result.performance_results?.core_web_vitals && result.performance_results?.source === 'google-pagespeed' && (
         <div className="bg-gradient-to-br from-green-50 to-emerald-50 rounded-lg p-6 mb-8 border border-green-200">
           <div className="flex items-center gap-2 mb-4">
             <div className="flex-shrink-0 w-10 h-10 bg-gradient-to-br from-green-500 to-emerald-600 rounded-lg flex items-center justify-center shadow">
@@ -220,32 +354,32 @@ export function ResultsPreview({ result, onEmailSubmit, onScanAnother }: Results
           </div>
           <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
             <div className="bg-white rounded-lg p-4 border border-green-200 shadow-sm">
-              <div className="text-2xl font-bold text-gray-900">{((result.performance_results as any).core_web_vitals.fcp / 1000).toFixed(2)}s</div>
+              <div className="text-2xl font-bold text-gray-900">{((result.performance_results?.core_web_vitals?.fcp ?? 0) / 1000).toFixed(2)}s</div>
               <div className="text-xs font-medium text-gray-600 mt-1">First Contentful Paint</div>
               <div className="text-xs text-gray-500 mt-1">How quickly content appears</div>
             </div>
             <div className="bg-white rounded-lg p-4 border border-green-200 shadow-sm">
-              <div className="text-2xl font-bold text-gray-900">{((result.performance_results as any).core_web_vitals.lcp / 1000).toFixed(2)}s</div>
+              <div className="text-2xl font-bold text-gray-900">{((result.performance_results?.core_web_vitals?.lcp ?? 0) / 1000).toFixed(2)}s</div>
               <div className="text-xs font-medium text-gray-600 mt-1">Largest Contentful Paint</div>
               <div className="text-xs text-gray-500 mt-1">Main content load time</div>
             </div>
             <div className="bg-white rounded-lg p-4 border border-green-200 shadow-sm">
-              <div className="text-2xl font-bold text-gray-900">{(result.performance_results as any).core_web_vitals.cls}</div>
+              <div className="text-2xl font-bold text-gray-900">{result.performance_results?.core_web_vitals?.cls ?? 0}</div>
               <div className="text-xs font-medium text-gray-600 mt-1">Cumulative Layout Shift</div>
               <div className="text-xs text-gray-500 mt-1">Visual stability score</div>
             </div>
             <div className="bg-white rounded-lg p-4 border border-green-200 shadow-sm">
-              <div className="text-2xl font-bold text-gray-900">{Math.round((result.performance_results as any).core_web_vitals.tbt)}ms</div>
+              <div className="text-2xl font-bold text-gray-900">{Math.round(result.performance_results?.core_web_vitals?.tbt ?? 0)}ms</div>
               <div className="text-xs font-medium text-gray-600 mt-1">Total Blocking Time</div>
               <div className="text-xs text-gray-500 mt-1">Interactivity delay</div>
             </div>
             <div className="bg-white rounded-lg p-4 border border-green-200 shadow-sm">
-              <div className="text-2xl font-bold text-gray-900">{((result.performance_results as any).core_web_vitals.tti / 1000).toFixed(2)}s</div>
+              <div className="text-2xl font-bold text-gray-900">{((result.performance_results?.core_web_vitals?.tti ?? 0) / 1000).toFixed(2)}s</div>
               <div className="text-xs font-medium text-gray-600 mt-1">Time to Interactive</div>
               <div className="text-xs text-gray-500 mt-1">When page is usable</div>
             </div>
             <div className="bg-white rounded-lg p-4 border border-green-200 shadow-sm">
-              <div className="text-2xl font-bold text-gray-900">{((result.performance_results as any).core_web_vitals.speedIndex / 1000).toFixed(2)}s</div>
+              <div className="text-2xl font-bold text-gray-900">{((result.performance_results?.core_web_vitals?.speedIndex ?? 0) / 1000).toFixed(2)}s</div>
               <div className="text-xs font-medium text-gray-600 mt-1">Speed Index</div>
               <div className="text-xs text-gray-500 mt-1">Visual completion speed</div>
             </div>
@@ -253,7 +387,7 @@ export function ResultsPreview({ result, onEmailSubmit, onScanAnother }: Results
         </div>
       )}
 
-      {(result.performance_results as any)?.lighthouse_scores && (result.performance_results as any)?.source === 'google-pagespeed' && (
+      {result.performance_results?.lighthouse_scores && result.performance_results?.source === 'google-pagespeed' && (
         <div className="bg-gradient-to-br from-blue-50 to-indigo-50 rounded-lg p-6 mb-8 border border-blue-200">
           <h3 className="text-lg font-bold text-gray-900 mb-4 flex items-center gap-2">
             <BarChart3 className="w-5 h-5 text-blue-600" />
@@ -261,30 +395,30 @@ export function ResultsPreview({ result, onEmailSubmit, onScanAnother }: Results
           </h3>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div className="bg-white rounded-lg p-4 border border-blue-200 shadow-sm text-center">
-              <div className={`text-3xl font-bold ${getScoreColor((result.performance_results as any).lighthouse_scores.performance)}`}>
-                {(result.performance_results as any).lighthouse_scores.performance}
+              <div className={`text-3xl font-bold ${getScoreColor(result.performance_results?.lighthouse_scores?.performance ?? 0)}`}>
+                {result.performance_results?.lighthouse_scores?.performance ?? 0}
               </div>
               <div className="text-sm font-medium text-gray-600 mt-2">Performance</div>
             </div>
-            {(result.performance_results as any).lighthouse_scores.accessibility && (
+            {result.performance_results?.lighthouse_scores?.accessibility && (
               <div className="bg-white rounded-lg p-4 border border-blue-200 shadow-sm text-center">
-                <div className={`text-3xl font-bold ${getScoreColor((result.performance_results as any).lighthouse_scores.accessibility)}`}>
-                  {(result.performance_results as any).lighthouse_scores.accessibility}
+                <div className={`text-3xl font-bold ${getScoreColor(result.performance_results?.lighthouse_scores?.accessibility ?? 0)}`}>
+                  {result.performance_results?.lighthouse_scores?.accessibility ?? 0}
                 </div>
                 <div className="text-sm font-medium text-gray-600 mt-2">Accessibility</div>
               </div>
             )}
-            {(result.performance_results as any).lighthouse_scores.bestPractices && (
+            {result.performance_results?.lighthouse_scores?.bestPractices && (
               <div className="bg-white rounded-lg p-4 border border-blue-200 shadow-sm text-center">
-                <div className={`text-3xl font-bold ${getScoreColor((result.performance_results as any).lighthouse_scores.bestPractices)}`}>
-                  {(result.performance_results as any).lighthouse_scores.bestPractices}
+                <div className={`text-3xl font-bold ${getScoreColor(result.performance_results?.lighthouse_scores?.bestPractices ?? 0)}`}>
+                  {result.performance_results?.lighthouse_scores?.bestPractices ?? 0}
                 </div>
                 <div className="text-sm font-medium text-gray-600 mt-2">Best Practices</div>
               </div>
             )}
             <div className="bg-white rounded-lg p-4 border border-blue-200 shadow-sm text-center">
-              <div className={`text-3xl font-bold ${getScoreColor((result.performance_results as any).lighthouse_scores.seo)}`}>
-                {(result.performance_results as any).lighthouse_scores.seo}
+              <div className={`text-3xl font-bold ${getScoreColor(result.performance_results?.lighthouse_scores?.seo ?? 0)}`}>
+                {result.performance_results?.lighthouse_scores?.seo ?? 0}
               </div>
               <div className="text-sm font-medium text-gray-600 mt-2">SEO</div>
             </div>
@@ -456,6 +590,6 @@ export function ResultsPreview({ result, onEmailSubmit, onScanAnother }: Results
           </div>
         </div>
       )}
-    </div>
+    </>
   );
 }

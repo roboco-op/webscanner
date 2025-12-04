@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
+import type { ScanResult as DBScanRow, TopIssue, SecurityIssue, AccessibilityIssue, APIEndpoint } from '../../../src/types/scan';
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -8,6 +9,7 @@ const corsHeaders = {
 };
 
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
+const PDF_API_KEY = Deno.env.get("HTML_to_PDF_API_KEY");
 
 interface ReportRequest {
   scanId: string;
@@ -26,6 +28,8 @@ Deno.serve(async (req: Request) => {
     const { scanId, email }: ReportRequest = await req.json();
 
     console.log(`Processing report request for ${email}, scan ${scanId}`);
+    console.log(`RESEND_API_KEY configured: ${!!RESEND_API_KEY}`);
+    console.log(`RESEND_API_KEY value (first 10 chars): ${RESEND_API_KEY?.substring(0, 10) || 'NOT SET'}`);
 
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
@@ -49,26 +53,72 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const htmlReport = generateHTMLReport(scanResult);
-    const textReport = generateTextReport(scanResult);
+    const htmlReport = generateHTMLReport(scanResult as DBScanRow);
+    const textReport = generateTextReport(scanResult as DBScanRow);
+
+    console.log(`Report generated. HTML: ${htmlReport.length} chars, Text: ${textReport.length} chars`);
+
+    // Generate PDF from HTML using PDFlayer API
+    let pdfBuffer: ArrayBuffer | null = null;
+    if (PDF_API_KEY) {
+      try {
+        console.log("Generating PDF from HTML...");
+        
+        // Use FormData to send HTML content to PDFlayer
+        const formData = new FormData();
+        formData.append("access_key", PDF_API_KEY);
+        formData.append("document_html", htmlReport);
+        formData.append("page_size", "A4");
+        
+        const pdfResponse = await fetch("http://api.pdflayer.com/api/convert", {
+          method: "POST",
+          body: formData,
+        });
+
+        if (pdfResponse.ok) {
+          pdfBuffer = await pdfResponse.arrayBuffer();
+          console.log(`PDF generated successfully. Size: ${pdfBuffer.byteLength} bytes`);
+        } else {
+          const pdfError = await pdfResponse.text();
+          console.warn("PDF generation failed:", pdfError);
+        }
+      } catch (pdfErr) {
+        console.warn("PDF generation error:", pdfErr);
+      }
+    }
 
     if (RESEND_API_KEY) {
       console.log("Sending email via Resend...");
       
       try {
+        const emailPayload: Record<string, unknown> = {
+          from: "Robolab Scanner <noreply@robo-lab.io>",
+          to: [email],
+          subject: `Website Scan Report - ${scanResult.target_url}`,
+          html: htmlReport,
+          text: textReport,
+        };
+
+        // Add PDF attachment if available
+        if (pdfBuffer) {
+          const pdfBase64 = btoa(String.fromCharCode(...new Uint8Array(pdfBuffer)));
+          emailPayload.attachments = [
+            {
+              filename: `website-scan-${scanResult.target_url.replace(/[^a-z0-9]/gi, '_')}.pdf`,
+              content: pdfBase64,
+              content_type: "application/pdf",
+            },
+          ];
+          console.log("PDF attached to email");
+        }
+
         const emailResponse = await fetch("https://api.resend.com/emails", {
           method: "POST",
           headers: {
             "Authorization": `Bearer ${RESEND_API_KEY}`,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({
-            from: "Robolab Scanner <noreply@robo-lab.io>",
-            to: [email],
-            subject: `Website Scan Report - ${scanResult.target_url}`,
-            html: htmlReport,
-            text: textReport,
-          }),
+          body: JSON.stringify(emailPayload),
         });
 
         if (!emailResponse.ok) {
@@ -137,7 +187,30 @@ Deno.serve(async (req: Request) => {
   }
 });
 
-function generateHTMLReport(scanResult: any): string {
+function parseAISummary(raw: string | null): { summary: string | null; recommendations: string[] } {
+  if (!raw) return { summary: null, recommendations: [] };
+  
+  try {
+    // Remove markdown code blocks
+    let jsonStr = raw.trim();
+    if (jsonStr.startsWith('```json')) {
+      jsonStr = jsonStr.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+    } else if (jsonStr.startsWith('```')) {
+      jsonStr = jsonStr.replace(/^```\s*/, '').replace(/\s*```$/, '');
+    }
+    
+    const parsed = JSON.parse(jsonStr);
+    return {
+      summary: parsed.summary || null,
+      recommendations: parsed.recommendations || []
+    };
+  } catch {
+    // If parsing fails, return raw content as summary
+    return { summary: raw, recommendations: [] };
+  }
+}
+
+function generateHTMLReport(scanResult: DBScanRow): string {
   const scoreColor = (score: number) => {
     if (score >= 80) return '#10b981';
     if (score >= 60) return '#f59e0b';
@@ -153,6 +226,13 @@ function generateHTMLReport(scanResult: any): string {
     };
     return `<span style="background-color: ${colors[severity] || '#6b7280'}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600;">${severity.toUpperCase()}</span>`;
   };
+
+  // Parse AI summary from markdown if needed
+  const aiData = parseAISummary(scanResult.ai_summary ?? null);
+  const aiSummary = aiData.summary;
+  const aiRecommendations = Array.isArray(scanResult.ai_recommendations) && scanResult.ai_recommendations.length > 0
+    ? scanResult.ai_recommendations
+    : aiData.recommendations;
 
   return `
 <!DOCTYPE html>
@@ -193,18 +273,18 @@ function generateHTMLReport(scanResult: any): string {
     </table>
   </div>
 
-  ${scanResult.ai_summary ? `
+  ${aiSummary ? `
   <div style="background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-radius: 12px; padding: 30px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 2px solid #3b82f6;">
     <h2 style="color: #1e40af; margin-top: 0; border-bottom: 2px solid #60a5fa; padding-bottom: 10px;">🤖 AI-Powered Analysis</h2>
-    <p style="color: #1e3a8a; line-height: 1.8; margin: 0; font-size: 15px;"><strong>Summary:</strong> ${scanResult.ai_summary}</p>
+    <p style="color: #1e3a8a; line-height: 1.8; margin: 0; font-size: 15px;"><strong>Summary:</strong> ${aiSummary}</p>
   </div>
   ` : ''}
 
-  ${scanResult.ai_recommendations && scanResult.ai_recommendations.length > 0 ? `
+  ${aiRecommendations && aiRecommendations.length > 0 ? `
   <div style="background: white; border-radius: 12px; padding: 30px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
     <h2 style="color: #111827; margin-top: 0; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px;">💡 AI Recommendations</h2>
     <ol style="color: #374151; line-height: 1.8; padding-left: 20px;">
-      ${scanResult.ai_recommendations.map((rec: string) => `<li style="margin-bottom: 12px;">${rec}</li>`).join('')}
+      ${aiRecommendations.map((rec: string) => `<li style="margin-bottom: 12px;">${rec}</li>`).join('')}
     </ol>
   </div>
   ` : ''}
@@ -212,11 +292,11 @@ function generateHTMLReport(scanResult: any): string {
   ${scanResult.top_issues && scanResult.top_issues.length > 0 ? `
   <div style="background: white; border-radius: 12px; padding: 30px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
     <h2 style="color: #111827; margin-top: 0; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px;">⚠️ Top Issues</h2>
-    ${scanResult.top_issues.map((issue: any, idx: number) => `
+    ${scanResult.top_issues.map((issue: TopIssue) => `
       <div style="background: #fef3c7; border-left: 4px solid #f59e0b; padding: 15px; margin-bottom: 15px; border-radius: 4px;">
         <div style="margin-bottom: 5px;">
           <strong style="color: #92400e;">${issue.category}</strong>
-          ${severityBadge(issue.severity)}
+          ${severityBadge(issue.severity || 'low')}
         </div>
         <p style="margin: 5px 0 0 0; color: #78350f;">${issue.description}</p>
       </div>
@@ -232,9 +312,9 @@ function generateHTMLReport(scanResult: any): string {
     ${scanResult.security_results?.issues && scanResult.security_results.issues.length > 0 ? `
       <h3 style="color: #374151; font-size: 16px; margin-top: 20px;">Issues Found:</h3>
       <ul style="list-style: none; padding: 0;">
-        ${scanResult.security_results.issues.map((issue: any) => `
+        ${scanResult.security_results.issues.map((issue: SecurityIssue) => `
           <li style="padding: 8px 0; border-bottom: 1px solid #f3f4f6;">
-            ${severityBadge(issue.severity)} ${issue.message}
+            ${severityBadge(issue.severity || 'low')} ${issue.message}
           </li>
         `).join('')}
       </ul>
@@ -271,13 +351,31 @@ function generateHTMLReport(scanResult: any): string {
     
     ${scanResult.accessibility_results?.issues && scanResult.accessibility_results.issues.length > 0 ? `
       <ul style="list-style: none; padding: 0;">
-        ${scanResult.accessibility_results.issues.map((issue: any) => `
+        ${scanResult.accessibility_results.issues.map((issue: AccessibilityIssue) => `
           <li style="padding: 8px 0; border-bottom: 1px solid #f3f4f6;">
-            ${severityBadge(issue.severity)} ${issue.message}
+            ${severityBadge(issue.severity || 'low')} ${issue.message}
           </li>
         `).join('')}
       </ul>
     ` : '<p style="color: #10b981;">✓ No accessibility issues detected</p>'}
+  </div>
+
+  <div style="background: white; border-radius: 12px; padding: 30px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+    <h2 style="color: #111827; margin-top: 0; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px;">🤖 End-to-End Testing Insights</h2>
+    <p><strong>Buttons Found:</strong> ${scanResult.e2e_results?.buttons_found || 0}</p>
+    <p><strong>Links Found:</strong> ${scanResult.e2e_results?.links_found || 0}</p>
+    <p><strong>Forms Found:</strong> ${scanResult.e2e_results?.forms_found || 0}</p>
+    
+    ${scanResult.e2e_results?.primary_actions && scanResult.e2e_results.primary_actions.length > 0 ? `
+      <h3 style="color: #374151; font-size: 16px; margin-top: 20px;">Primary Actions Detected:</h3>
+      <ul style="list-style: none; padding: 0; color: #374151;">
+        ${scanResult.e2e_results.primary_actions.map((action: string) => `
+          <li style="padding: 8px 0; border-bottom: 1px solid #f3f4f6;">
+            • ${action}
+          </li>
+        `).join('')}
+      </ul>
+    ` : '<p style="color: #9ca3af;">No primary actions detected</p>'}
   </div>
 
   <div style="background: linear-gradient(135deg, #f3f4f6 0%, #e5e7eb 100%); border-radius: 12px; padding: 30px; text-align: center;">
@@ -296,38 +394,39 @@ function generateHTMLReport(scanResult: any): string {
   `;
 }
 
-function generateTextReport(scanResult: any): string {
+function generateTextReport(scanResult: DBScanRow): string {
+  const sr = scanResult;
   return `
 =================================================
 ROBO-LAB WEB SCANNER - COMPREHENSIVE REPORT
 =================================================
 
-Target URL: ${scanResult.target_url}
-Scan Date: ${new Date(scanResult.created_at).toLocaleString()}
-Overall Score: ${scanResult.overall_score}/100
+Target URL: ${sr.target_url}
+Scan Date: ${new Date(sr.created_at).toLocaleString()}
+Overall Score: ${sr.overall_score}/100
 
 -------------------------------------------------
 EXECUTIVE SUMMARY
 -------------------------------------------------
 
-${scanResult.top_issues && scanResult.top_issues.length > 0 ? 'Critical Issues Identified:' : 'No Critical Issues Detected'}
-${scanResult.top_issues ? scanResult.top_issues.map((issue: any, idx: number) => `
-${idx + 1}. [${issue.severity.toUpperCase()}] ${issue.category}
-   ${issue.description}
+${sr.top_issues && sr.top_issues.length > 0 ? 'Critical Issues Identified:' : 'No Critical Issues Detected'}
+${sr.top_issues ? sr.top_issues.map((issue: TopIssue) => `
+${sr.top_issues!.indexOf(issue) + 1}. [${(issue.severity || '').toUpperCase()}] ${issue.category}
+  ${issue.description}
 `).join('') : ''}
 
 -------------------------------------------------
 SECURITY ANALYSIS
 -------------------------------------------------
 
-Score: ${scanResult.security_results?.score || 'N/A'}/100
-Protocol: ${scanResult.security_results?.protocol || 'N/A'}
+Score: ${sr.security_results?.score || 'N/A'}/100
+Protocol: ${sr.security_results?.protocol || 'N/A'}
 
 Security Headers:
-${scanResult.security_results?.security_headers ? Object.entries(scanResult.security_results.security_headers).map(([key, value]) => `  - ${key}: ${value || 'Missing'}`).join('\n') : '  N/A'}
+${sr.security_results?.security_headers ? Object.entries(sr.security_results.security_headers).map(([key, value]) => `  - ${key}: ${value || 'Missing'}`).join('\n') : '  N/A'}
 
 Issues Found:
-${scanResult.security_results?.issues ? scanResult.security_results.issues.map((issue: any, idx: number) => `  ${idx + 1}. [${issue.severity}] ${issue.message}`).join('\n') : '  None'}
+${sr.security_results?.issues ? sr.security_results.issues.map((issue: SecurityIssue, idx: number) => `  ${idx + 1}. [${issue.severity}] ${issue.message}`).join('\n') : '  None'}
 
 Recommendations:
   - Implement HSTS with long max-age
@@ -339,12 +438,12 @@ Recommendations:
 PERFORMANCE ANALYSIS
 -------------------------------------------------
 
-Score: ${scanResult.performance_results?.score || 'N/A'}/100
-Load Time: ${scanResult.performance_results?.load_time_ms || 'N/A'}ms
-Page Size: ${scanResult.performance_results?.page_size_kb || 'N/A'}KB
-Images: ${scanResult.performance_results?.images_count || 0}
-Scripts: ${scanResult.performance_results?.scripts_count || 0}
-Stylesheets: ${scanResult.performance_results?.stylesheets_count || 0}
+Score: ${sr.performance_results?.score || 'N/A'}/100
+Load Time: ${sr.performance_results?.load_time_ms || 'N/A'}ms
+Page Size: ${sr.performance_results?.page_size_kb || 'N/A'}KB
+Images: ${sr.performance_results?.images_count || 0}
+Scripts: ${sr.performance_results?.scripts_count || 0}
+Stylesheets: ${sr.performance_results?.stylesheets_count || 0}
 
 Recommendations:
   - Optimize images (WebP format, lazy loading)
@@ -357,11 +456,11 @@ Recommendations:
 ACCESSIBILITY ANALYSIS
 -------------------------------------------------
 
-Score: ${scanResult.accessibility_results?.score || 'N/A'}/100
-Total Issues: ${scanResult.accessibility_results?.total_issues || 0}
+Score: ${sr.accessibility_results?.score || 'N/A'}/100
+Total Issues: ${sr.accessibility_results?.total_issues || 0}
 
 Issues Found:
-${scanResult.accessibility_results?.issues ? scanResult.accessibility_results.issues.map((issue: any, idx: number) => `  ${idx + 1}. [${issue.severity}] ${issue.message}`).join('\n') : '  None'}
+${sr.accessibility_results?.issues ? sr.accessibility_results.issues.map((issue: AccessibilityIssue, idx: number) => `  ${idx + 1}. [${issue.severity}] ${issue.message}`).join('\n') : '  None'}
 
 Recommendations:
   - Add alt text to all images
@@ -374,9 +473,9 @@ Recommendations:
 API ANALYSIS
 -------------------------------------------------
 
-Endpoints Detected: ${scanResult.api_results?.endpoints_detected || 0}
+Endpoints Detected: ${sr.api_results?.endpoints_detected || 0}
 
-${scanResult.api_results?.endpoints ? scanResult.api_results.endpoints.map((ep: any, idx: number) => `  ${idx + 1}. ${ep.method} ${ep.path}`).join('\n') : '  None detected'}
+${sr.api_results?.endpoints ? sr.api_results.endpoints.map((ep: APIEndpoint, idx: number) => `  ${idx + 1}. ${ep.method} ${ep.path}`).join('\n') : '  None detected'}
 
 Recommendations:
   - Implement proper CORS policies
@@ -388,18 +487,18 @@ Recommendations:
 E2E TESTING INSIGHTS
 -------------------------------------------------
 
-Buttons Found: ${scanResult.e2e_results?.buttons_found || 0}
-Links Found: ${scanResult.e2e_results?.links_found || 0}
-Forms Found: ${scanResult.e2e_results?.forms_found || 0}
+Buttons Found: ${sr.e2e_results?.buttons_found || 0}
+Links Found: ${sr.e2e_results?.links_found || 0}
+Forms Found: ${sr.e2e_results?.forms_found || 0}
 
 Primary Actions:
-${scanResult.e2e_results?.primary_actions ? scanResult.e2e_results.primary_actions.map((action: string, idx: number) => `  ${idx + 1}. ${action}`).join('\n') : '  None'}
+${sr.e2e_results?.primary_actions ? sr.e2e_results.primary_actions.map((action: string, idx: number) => `  ${idx + 1}. ${action}`).join('\n') : '  None'}
 
 -------------------------------------------------
 TECHNOLOGY STACK
 -------------------------------------------------
 
-${scanResult.tech_stack?.detected ? scanResult.tech_stack.detected.map((tech: any, idx: number) => `  ${idx + 1}. ${tech.name} (${tech.confidence} confidence)`).join('\n') : '  Unable to detect'}
+${sr.tech_stack?.detected ? sr.tech_stack.detected.map((tech, idx) => `  ${idx + 1}. ${tech.name} (${tech.confidence} confidence)`).join('\n') : '  Unable to detect'}
 
 -------------------------------------------------
 NEXT STEPS

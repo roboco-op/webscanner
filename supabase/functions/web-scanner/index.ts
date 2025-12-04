@@ -1,6 +1,62 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
+// Type definitions for scan results (duplicated from src/types/scan.ts for Deno compatibility)
+type PerformanceResults = {
+  score: number;
+  load_time_ms: number;
+  image_count?: number;
+  scripts_count?: number;
+  stylesheets_count?: number;
+  compression_enabled?: boolean;
+  caching_enabled?: boolean;
+  lighthouse_scores?: { performance?: number; seo?: number; accessibility?: number; bestPractices?: number };
+  core_web_vitals?: Record<string, number>;
+  source?: string;
+  opportunities?: Array<{ title?: string; score?: number; savings?: number }>;
+  diagnostics?: Array<{ title?: string; score?: number }>;
+};
+
+type SecurityResults = {
+  issues: Array<{ severity: string; category?: string; description?: string; message?: string }>;
+  checks_performed: number;
+  checks_passed: number;
+  https_enabled: boolean;
+};
+
+type AccessibilityResults = {
+  issues: Array<{ severity: string; message?: string; count?: number; wcag?: string }>;
+  total_issues: number;
+  score: number;
+  wcag_level?: string;
+};
+
+type E2EResults = {
+  buttons_found: number;
+  links_found: number;
+  forms_found: number;
+  primary_actions: string[];
+  error?: string;
+};
+
+type APIResults = {
+  endpoints_detected: number;
+  endpoints: Array<{ method: string; path: string; status: number }>;
+  error?: string;
+};
+
+type TechStackResult = {
+  detected: Array<{ name: string; confidence: string; version?: string; category: string }>;
+  total_detected: number;
+  error?: string;
+};
+
+type TopIssue = {
+  category: string;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  description: string;
+};
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
@@ -20,21 +76,47 @@ Deno.serve(async (req: Request) => {
     });
   }
 
-  let scanId: string | null = null;
-  let supabase: any = null;
-
   try {
     const body: ScanRequest = await req.json();
-    scanId = body.scanId;
+    const scanId = body.scanId;
     const url = body.url;
 
     console.log(`Starting scan for ${url} with ID ${scanId}`);
 
-    supabase = createClient(
+    const supabase = createClient(
       Deno.env.get("SUPABASE_URL") ?? "",
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
     );
 
+    // Start processing asynchronously (don't await)
+    processScan(scanId, url, supabase).catch(error => {
+      console.error(`Async scan processing error for ${scanId}:`, error);
+    });
+
+    // Return immediately so function doesn't time out
+    return new Response(
+      JSON.stringify({ success: true, scanId, message: "Scan started" }),
+      {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    );
+  } catch (error) {
+    console.error("Request error:", error);
+    return new Response(
+      JSON.stringify({
+        error: error instanceof Error ? error.message : "Invalid request",
+      }),
+      {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    );
+  }
+});
+
+async function processScan(scanId: string, url: string, supabase: ReturnType<typeof createClient>) {
+  try {
     await supabase
       .from("scan_results")
       .update({ scan_status: "processing" })
@@ -106,14 +188,13 @@ Deno.serve(async (req: Request) => {
       console.error("AI analysis failed:", aiError);
     }
 
-    const performanceScore = (scanResults.performance as any)?.score ||
-                            (scanResults.performance as any)?.lighthouse_scores?.performance || 0;
-    const seoScore = (scanResults.performance as any)?.lighthouse_scores?.seo || 0;
-    const accessibilityIssueCount = (scanResults.accessibility as any)?.total_issues || 0;
-    const securityIssues = (scanResults.security as any)?.issues || [];
+    const performanceScore = scanResults.performance?.score || scanResults.performance?.lighthouse_scores?.performance || 0;
+    const seoScore = scanResults.performance?.lighthouse_scores?.seo || 0;
+    const accessibilityIssueCount = scanResults.accessibility?.total_issues || 0;
+    const securityIssues = scanResults.security?.issues || [];
     const securityChecksPassed = Math.max(0, 7 - securityIssues.length);
-    const technologies = (scanResults.techStack as any)?.detected?.map((t: any) => t.name) || [];
-    const exposedEndpoints = (scanResults.api as any)?.endpoints?.map((e: any) => e.path) || [];
+    const technologies = scanResults.techStack?.detected?.map((t) => t.name) || [];
+    const exposedEndpoints = scanResults.api?.endpoints?.map((e) => e.path) || [];
 
     const { error: updateError } = await supabase
       .from("scan_results")
@@ -145,48 +226,38 @@ Deno.serve(async (req: Request) => {
     }
 
     console.log("Scan completed successfully");
-
-    return new Response(
-      JSON.stringify({ success: true, scanId, overallScore, topIssues }),
-      {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      }
-    );
   } catch (error) {
-    console.error("Scan error:", error);
+    console.error("Scan processing error:", error);
 
-    if (scanId && supabase) {
-      try {
-        await supabase
-          .from("scan_results")
-          .update({ scan_status: "failed" })
-          .eq("id", scanId);
-      } catch (updateErr) {
-        console.error("Failed to update scan status to failed:", updateErr);
-      }
+    try {
+      await supabase
+        .from("scan_results")
+        .update({ scan_status: "failed" })
+        .eq("id", scanId);
+    } catch (updateErr) {
+      console.error("Failed to update scan status to failed:", updateErr);
     }
-
-    return new Response(
-      JSON.stringify({
-        error: error instanceof Error ? error.message : "Scan failed",
-      }),
-      {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      }
-    );
   }
-});
+}
 
-async function performScan(url: string) {
-  const results = {
-    e2e: { status: "pending" },
-    api: { status: "pending" },
-    security: { status: "pending" },
-    performance: { status: "pending" },
-    accessibility: { status: "pending" },
-    techStack: { status: "pending" },
+type PipelineSection<T> = T & { status?: 'pending' | 'completed' | 'failed'; error?: string };
+type PipelineResults = {
+  e2e?: PipelineSection<E2EResults>;
+  api?: PipelineSection<APIResults>;
+  security?: PipelineSection<SecurityResults>;
+  performance?: PipelineSection<PerformanceResults>;
+  accessibility?: PipelineSection<AccessibilityResults>;
+  techStack?: PipelineSection<TechStackResult>;
+};
+
+async function performScan(url: string): Promise<PipelineResults> {
+  const results: PipelineResults = {
+    e2e: { status: 'pending' },
+    api: { status: 'pending' },
+    security: { status: 'pending' },
+    performance: { status: 'pending' },
+    accessibility: { status: 'pending' },
+    techStack: { status: 'pending' },
   };
 
   try {
@@ -234,7 +305,7 @@ async function performScan(url: string) {
   return results;
 }
 
-async function performE2EScan(url: string) {
+async function performE2EScan(url: string): Promise<PipelineSection<E2EResults>> {
   try {
     console.log(`E2E scan: fetching ${url}`);
     const controller = new AbortController();
@@ -266,17 +337,43 @@ async function performE2EScan(url: string) {
     const html = await response.text();
     console.log(`E2E scan: received ${html.length} bytes`);
 
-    const buttonMatches = html.match(/<button[^>]*>([^<]*)<\/button>/gi) || [];
-    const linkMatches = html.match(/<a[^>]*href=["']([^"']*)["'][^>]*>/gi) || [];
-    const formMatches = html.match(/<form[^>]*>/gi) || [];
+    // Prefer a DOM-based parse for accuracy; fall back to regex if DOMParser isn't available.
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, 'text/html');
 
-    return {
-      buttons_found: buttonMatches.length,
-      links_found: linkMatches.length,
-      forms_found: formMatches.length,
-      primary_actions: buttonMatches.slice(0, 5).map((btn) => btn.replace(/<[^>]*>/g, "").trim()).filter(s => s),
-      status: "completed",
-    };
+      const buttons = Array.from(doc.querySelectorAll('button'));
+      const anchors = Array.from(doc.querySelectorAll('a[href]'));
+      const forms = Array.from(doc.querySelectorAll('form'));
+
+      const primaryActions = buttons
+        .map(b => (b.textContent || '').trim())
+        .filter(Boolean)
+        .slice(0, 5);
+
+      return {
+        buttons_found: buttons.length,
+        links_found: anchors.length,
+        forms_found: forms.length,
+        primary_actions: primaryActions,
+        status: 'completed',
+      };
+    } catch {
+      // DOMParser may not be available in some runtimes; fall back to regex-based parsing.
+      console.warn('DOMParser not available, falling back to regex parsing for E2E scan');
+
+      const buttonMatches = html.match(/<button[^>]*>([\s\S]*?)<\/button>/gi) || [];
+      const linkMatches = html.match(/<a[^>]*href=["']([^"']*)["'][^>]*>/gi) || [];
+      const formMatches = html.match(/<form[^>]*>/gi) || [];
+
+      return {
+        buttons_found: buttonMatches.length,
+        links_found: linkMatches.length,
+        forms_found: formMatches.length,
+        primary_actions: buttonMatches.slice(0, 5).map((btn) => btn.replace(/<[^>]*>/g, '').trim()).filter(s => s),
+        status: 'completed',
+      };
+    }
   } catch (error) {
     console.error("E2E scan error:", error);
     return {
@@ -290,7 +387,7 @@ async function performE2EScan(url: string) {
   }
 }
 
-async function performAPIScan(url: string) {
+async function performAPIScan(url: string): Promise<PipelineSection<APIResults>> {
   const endpoints: Array<{ method: string; path: string; status: number }> = [];
 
   try {
@@ -333,7 +430,7 @@ async function performAPIScan(url: string) {
   }
 }
 
-async function performSecurityScan(url: string) {
+async function performSecurityScan(url: string): Promise<PipelineSection<SecurityResults>> {
   try {
     console.log(`Security scan: fetching ${url}`);
     const controller = new AbortController();
@@ -423,11 +520,13 @@ async function performSecurityScan(url: string) {
   }
 }
 
-async function performPerformanceScan(url: string) {
+async function performPerformanceScan(url: string): Promise<PipelineSection<PerformanceResults>> {
   try {
     console.log(`Performance scan: fetching ${url}`);
 
-    const pagespeedApiKey = Deno.env.get("GOOGLE_PAGESPEED_API_KEY");
+    const pagespeedApiKey =
+      Deno.env.get("GOOGLE_PAGESPEED_API_KEY") ||
+      Deno.env.get("PAGE_PAGESPEED_INSIGHTS_API_KEY");
 
     if (pagespeedApiKey) {
       console.log("Using Google PageSpeed Insights API");
@@ -447,7 +546,7 @@ async function performPerformanceScan(url: string) {
   }
 }
 
-async function performGooglePageSpeedScan(url: string, apiKey: string) {
+async function performGooglePageSpeedScan(url: string, apiKey: string): Promise<PipelineSection<PerformanceResults>> {
   try {
     const pagespeedUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&key=${apiKey}&category=performance&category=accessibility&category=best-practices&category=seo`;
 
@@ -512,8 +611,11 @@ async function performGooglePageSpeedScan(url: string, apiKey: string) {
   }
 }
 
-function extractPageSpeedOpportunities(audits: any) {
-  const opportunities = [];
+type PageSpeedAudit = { title?: string; description?: string; score?: number | null; details?: Record<string, unknown> };
+type PageSpeedAudits = Record<string, PageSpeedAudit>;
+
+function extractPageSpeedOpportunities(audits: PageSpeedAudits) {
+  const opportunities: Array<{ title?: string; description?: string; score?: number | null; savings?: number }> = [];
   const opportunityAudits = [
     'render-blocking-resources',
     'unused-css-rules',
@@ -527,12 +629,14 @@ function extractPageSpeedOpportunities(audits: any) {
 
   for (const auditId of opportunityAudits) {
     const audit = audits[auditId];
-    if (audit && audit.score !== null && audit.score < 1) {
+    if (audit && typeof audit.score === 'number' && audit.score < 1) {
+      const details = audit.details as Record<string, unknown> | undefined;
+      const savings = details && typeof details['overallSavingsMs'] === 'number' ? (details['overallSavingsMs'] as number) : 0;
       opportunities.push({
-        title: audit.title,
+        title: audit.title || auditId,
         description: audit.description,
         score: audit.score,
-        savings: audit.details?.overallSavingsMs || 0,
+        savings,
       });
     }
   }
@@ -540,8 +644,8 @@ function extractPageSpeedOpportunities(audits: any) {
   return opportunities.slice(0, 5);
 }
 
-function extractPageSpeedDiagnostics(audits: any) {
-  const diagnostics = [];
+function extractPageSpeedDiagnostics(audits: PageSpeedAudits) {
+  const diagnostics: Array<{ title?: string; description?: string; score?: number | null }> = [];
   const diagnosticAudits = [
     'dom-size',
     'total-byte-weight',
@@ -552,9 +656,9 @@ function extractPageSpeedDiagnostics(audits: any) {
 
   for (const auditId of diagnosticAudits) {
     const audit = audits[auditId];
-    if (audit && audit.score !== null && audit.score < 1) {
+    if (audit && typeof audit.score === 'number' && audit.score < 1) {
       diagnostics.push({
-        title: audit.title,
+        title: audit.title || auditId,
         description: audit.description,
         score: audit.score,
       });
@@ -564,7 +668,7 @@ function extractPageSpeedDiagnostics(audits: any) {
   return diagnostics.slice(0, 5);
 }
 
-async function performBasicPerformanceScan(url: string) {
+async function performBasicPerformanceScan(url: string): Promise<PipelineSection<PerformanceResults>> {
   const startTime = performance.now();
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 15000);
@@ -607,8 +711,8 @@ async function performBasicPerformanceScan(url: string) {
     score,
     load_time_ms: Math.round(loadTime),
     image_count: imageCount,
-    script_count: scriptCount,
-    stylesheet_count: stylesheetCount,
+    scripts_count: scriptCount,
+    stylesheets_count: stylesheetCount,
     compression_enabled: hasGzip,
     caching_enabled: hasCaching,
     lighthouse_scores: {
@@ -620,7 +724,7 @@ async function performBasicPerformanceScan(url: string) {
   };
 }
 
-async function performAccessibilityScan(url: string) {
+async function performAccessibilityScan(url: string): Promise<PipelineSection<AccessibilityResults>> {
   try {
     console.log(`Accessibility scan: fetching ${url}`);
     const controller = new AbortController();
@@ -705,7 +809,7 @@ async function performAccessibilityScan(url: string) {
       });
     }
 
-    const hasSkipLink = /<a[^>]*href=[\"']#(main|content|skip)[\"'][^>]*>/i.test(html);
+    const hasSkipLink = /<a[^>]*href=["']#(main|content|skip)["'][^>]*>/i.test(html);
     if (!hasSkipLink) {
       issues.push({
         severity: "low",
@@ -714,7 +818,7 @@ async function performAccessibilityScan(url: string) {
       });
     }
 
-    const tabindexNegative = (html.match(/tabindex=[\"']-\d+[\"']/gi) || []).length;
+    const tabindexNegative = (html.match(/tabindex=["']-\d+["']/gi) || []).length;
     if (tabindexNegative > 0) {
       issues.push({
         severity: "medium",
@@ -747,7 +851,7 @@ async function performAccessibilityScan(url: string) {
   }
 }
 
-async function detectTechStack(url: string) {
+async function detectTechStack(url: string): Promise<PipelineSection<TechStackResult>> {
   try {
     console.log(`Tech stack detection: fetching ${url}`);
     const controller = new AbortController();
@@ -786,7 +890,7 @@ async function detectTechStack(url: string) {
     }
 
     if (html.includes("ng-version") || html.match(/<[^>]*ng-[^>]*>/i)) {
-      const versionMatch = html.match(/ng-version=\"([^\"]+)\"/); 
+      const versionMatch = html.match(/ng-version="([^"]+)"/); 
       detected.push({
         name: "Angular",
         confidence: "high",
@@ -796,7 +900,7 @@ async function detectTechStack(url: string) {
     }
 
     if (html.includes("wp-content") || html.includes("wp-includes") || html.includes("/wordpress/")) {
-      const versionMatch = html.match(/wp-content\/themes\/[^\/]+\/([0-9.]+)/);
+      const versionMatch = html.match(new RegExp('wp-content/themes/[^/]+/([0-9.]+)'));
       detected.push({
         name: "WordPress",
         confidence: "high",
@@ -809,7 +913,7 @@ async function detectTechStack(url: string) {
       detected.push({ name: "Drupal", confidence: "high", category: "CMS" });
     }
 
-    if (html.includes("__svelte") || html.match(/<script[^>]*src=[\"'][^\"']*svelte[^\"']*[\"']/i)) {
+    if (html.includes("__svelte") || html.match(/<script[^>]*src=["'][^"']*svelte[^"']*["']/i)) {
       detected.push({ name: "Svelte", confidence: "medium", category: "Framework" });
     }
 
@@ -823,11 +927,11 @@ async function detectTechStack(url: string) {
       });
     }
 
-    if (html.includes("tailwind") || html.match(/class=[\"'][^\"']*\b(flex|grid|bg-|text-|p-|m-|w-|h-)[^\"']*[\"']/)) {
+    if (html.includes("tailwind") || html.match(/class=["'][^"']*\b(flex|grid|bg-|text-|p-|m-|w-|h-)[^"']*["']/)) {
       detected.push({ name: "Tailwind CSS", confidence: "medium", category: "CSS Framework" });
     }
 
-    if (html.match(/class=[\"'][^\"']*\b(container|row|col-|btn|navbar)[^\"']*[\"']/) && !html.includes("tailwind")) {
+    if (html.match(/class=["'][^"']*\b(container|row|col-|btn|navbar)[^"']*["']/) && !html.includes("tailwind")) {
       detected.push({ name: "Bootstrap", confidence: "low", category: "CSS Framework" });
     }
 
@@ -875,44 +979,44 @@ async function detectTechStack(url: string) {
   }
 }
 
-function extractTopIssues(scanResults: any): Array<{ category: string; severity: string; description: string }> {
-  const issues: Array<{ category: string; severity: string; description: string }> = [];
+function extractTopIssues(scanResults: { security?: SecurityResults; accessibility?: AccessibilityResults; performance?: PerformanceResults }): TopIssue[] {
+  const issues: TopIssue[] = [];
 
   if (scanResults.security?.issues) {
-    scanResults.security.issues.forEach((issue: any) => {
+    scanResults.security.issues.forEach((issue) => {
       issues.push({
-        category: issue.category || "Security",
-        severity: issue.severity,
-        description: issue.description,
+        category: (issue.category as string) || 'Security',
+        severity: (issue.severity as TopIssue['severity']) || 'low',
+        description: (issue.description as string) || (issue.message as string) || '',
       });
     });
   }
 
   if (scanResults.accessibility?.issues) {
-    scanResults.accessibility.issues.forEach((issue: any) => {
+    scanResults.accessibility.issues.forEach((issue) => {
       issues.push({
-        category: "Accessibility",
-        severity: issue.severity,
-        description: issue.message,
+        category: 'Accessibility',
+        severity: (issue.severity as TopIssue['severity']) || 'low',
+        description: (issue.message as string) || '',
       });
     });
   }
 
-  if (scanResults.performance?.score < 50) {
+  if (scanResults.performance?.score !== undefined && scanResults.performance.score < 50) {
     issues.push({
-      category: "Performance",
-      severity: "high",
+      category: 'Performance',
+      severity: 'high',
       description: `Poor performance score (${scanResults.performance.score}/100) - site loads slowly`,
     });
   }
 
-  const sortOrder: {[key: string]: number} = { critical: 0, high: 1, medium: 2, low: 3 };
+  const sortOrder: { [key: string]: number } = { critical: 0, high: 1, medium: 2, low: 3 };
   issues.sort((a, b) => (sortOrder[a.severity] || 99) - (sortOrder[b.severity] || 99));
 
   return issues.slice(0, 10);
 }
 
-function calculateOverallScore(scanResults: any): number {
+function calculateOverallScore(scanResults: { security?: SecurityResults; performance?: PerformanceResults; accessibility?: AccessibilityResults; e2e?: E2EResults; api?: APIResults }): number {
   const weights = {
     security: 0.3,
     performance: 0.25,
@@ -940,8 +1044,8 @@ function calculateOverallScore(scanResults: any): number {
     totalWeight += weights.accessibility;
   }
 
-  if (scanResults.e2e?.status === "completed") {
-    const e2eScore = scanResults.e2e.buttons_found > 0 ? 80 : 50;
+  if (scanResults.e2e?.status === 'completed') {
+    const e2eScore = (scanResults.e2e.buttons_found || 0) > 0 ? 80 : 50;
     totalScore += e2eScore * weights.e2e;
     totalWeight += weights.e2e;
   }
@@ -955,11 +1059,12 @@ function calculateOverallScore(scanResults: any): number {
   return totalWeight > 0 ? Math.round(totalScore / totalWeight) : 0;
 }
 
-async function generateAIAnalysis(url: string, scanResults: any, topIssues: any[], overallScore: number) {
-  const openaiKey = Deno.env.get("OPENAI_API_KEY");
+async function generateAIAnalysis(url: string, scanResults: Partial<{ security?: SecurityResults; accessibility?: AccessibilityResults; performance?: PerformanceResults }>, topIssues: TopIssue[], overallScore: number) {
+  const geminiKey = Deno.env.get("GEMINI_API_KEY");
+  console.log("GEMINI_API_KEY value:", geminiKey);
 
-  if (!openaiKey) {
-    console.log("OpenAI API key not configured, skipping AI analysis");
+  if (!geminiKey) {
+    console.log("GEMINI_API_KEY not configured, skipping AI analysis");
     return { summary: null, recommendations: [] };
   }
 
@@ -975,54 +1080,68 @@ Performance Score: ${scanResults.performance?.score || 0}/100
 Top Issues:
 ${topIssues.map(issue => `- [${issue.severity}] ${issue.category}: ${issue.description}`).join('\n')}
 
+You are a web security and performance expert. Provide concise, actionable technical analysis.
+
 Provide:
 1. A brief 2-3 sentence technical summary
 2. Top 3-5 actionable recommendations
 
 Format as JSON: {"summary": "...", "recommendations": ["...", "..."]}`;
 
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    console.log("Gemini prompt:", prompt);
+
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${openaiKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-3.5-turbo",
-        messages: [
-          {
-            role: "system",
-            content: "You are a web security and performance expert. Provide concise, actionable technical analysis."
-          },
-          {
-            role: "user",
-            content: prompt
-          }
-        ],
-        temperature: 0.7,
-        max_tokens: 500,
+        contents: [{
+          parts: [{
+            text: prompt
+          }]
+        }],
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 500,
+        }
       }),
     });
 
+    console.log("Gemini API response status:", response.status);
+
     if (!response.ok) {
-      console.error("OpenAI API error:", response.status);
+      const txt = await response.text().catch(() => '');
+      console.error("Gemini API error:", response.status, txt);
       return { summary: null, recommendations: [] };
     }
 
     const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
+    console.log("Gemini API response data:", JSON.stringify(data));
+    const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
     if (!content) {
+      console.log("Gemini API returned no content");
       return { summary: null, recommendations: [] };
     }
 
     try {
-      const parsed = JSON.parse(content);
+      // Remove markdown code blocks if present
+      let jsonStr = content.trim();
+      if (jsonStr.startsWith('```json')) {
+        jsonStr = jsonStr.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+      } else if (jsonStr.startsWith('```')) {
+        jsonStr = jsonStr.replace(/^```\s*/, '').replace(/\s*```$/, '');
+      }
+      
+      const parsed = JSON.parse(jsonStr);
+      console.log("Gemini parsed summary:", parsed.summary);
       return {
         summary: parsed.summary || null,
         recommendations: parsed.recommendations || []
       };
-    } catch {
+    } catch (parseError) {
+      console.log("Gemini content not valid JSON, using raw content:", parseError);
       return {
         summary: content,
         recommendations: []
